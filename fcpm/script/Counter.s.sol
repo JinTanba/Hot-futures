@@ -1,19 +1,33 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity 0.8.4;
 
-import {Script, console} from "forge-std/Script.sol";
-import {Counter} from "../src/Counter.sol";
+import "forge-std/Test.sol";
+import "../src/Counter.sol";
 
-contract CounterScript is Script {
-    Counter public counter;
+contract EnvTestTest is Test {
+   EnvTest public envTest;
 
-    function setUp() public {}
+   function setUp() public {
+       envTest = new EnvTest();
+   }
 
-    function run() public {
-        vm.startBroadcast();
+   function test_sepoliaAddress() public view {
+       // Sepoliaアドレスの確認
+       address sepolia = envTest.sepolia();
+       console.log("Sepolia address:", sepolia);
+       assertEq(sepolia, Addresses.BASE_SEPOLIA);
+   }
 
-        counter = new Counter();
+   function test_number() public {
+       // 初期値の確認
+       assertEq(envTest.number(), 0);
 
-        vm.stopBroadcast();
-    }
+       // increment()実行
+       envTest.increment();
+       assertEq(envTest.number(), 1);
+
+       // setNumber()実行
+       envTest.setNumber(100);
+       assertEq(envTest.number(), 100);
+   }
 }

@@ -1,3 +1,9 @@
+[submodule "fcpm/lib/verifier-solidity-sdk"]
+	path = fcpm/lib/verifier-solidity-sdk
+	url = https://gitlab.reclaimprotocol.org/integrations/verifier-solidity-sdk.git
 [submodule "fcpm/lib/forge-std"]
 	path = fcpm/lib/forge-std
 	url = https://github.com/foundry-rs/forge-std
+[submodule "fcpm/lib/openzeppelin-contracts"]
+	path = fcpm/lib/openzeppelin-contracts
+	url = https://github.com/openzeppelin/openzeppelin-contracts
