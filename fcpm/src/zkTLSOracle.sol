@@ -2,79 +2,83 @@
 pragma solidity 0.8.4;
 import "verifier-solidity-sdk/Reclaim.sol";
 import "verifier-solidity-sdk/Addresses.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "./PredictionTokenFramwork.sol";
+import "forge-std/console.sol";
 
-library Schema {
-    struct Ids {
-        uint256 articleId;
-        uint256 propositionId;
-        uint256 providerId;
-        uint256 actionId;
-    }
-
-    struct Config {
-        address router;
-        bytes32 donID;
-        address link;
-        uint32 gasLimit;
-        uint64 subscriptionId;
-    }
-
-    struct Article {
-        string content;
-        address createdBy;
-        uint256 createdAt;
-        uint256 providerId;
-    }
-
-    struct Proposition {
-        string proposition;
-        uint256[] permittedProviderIds;
-    }
+contract Oracle {
+    address public predictionToken;
+    address immutable reclaimAddress;
+    address immutable owner;
 
     struct Provider {
-        string[] keys;
-        bytes32 providerHash;
-    }
-}
-
-library Storage {
-    uint256 constant IDS_SLOT = 1;
-    uint256 constant ARTICLE_SLOT = 2;
-    uint256 constant PROPOSITION_SLOT = 3;
-    uint256 constant PROVIDER_SLOT = 4;
-
-    function article(uint256 id) internal pure returns (Schema.Article storage s) {
-        assembly {
-            mstore(0, ARTICLE_SLOT)
-            mstore(32, id)
-            s.slot := keccak256(0, 64)
-        }
+        string countKey;
+        string userIdKey;
     }
 
-    function proposition(uint256 id) internal pure returns (Schema.Proposition storage s) {
-        assembly {
-            mstore(0, PROPOSITION_SLOT)
-            mstore(32, id)
-            s.slot := keccak256(0, 64)
-        }
+    mapping(bytes32 => Provider) public providers;
+
+    constructor() {
+        reclaimAddress = Addresses.BASE_SEPOLIA;
+        owner = msg.sender;
     }
 
-    function provider(uint256 id) internal pure returns (Schema.Provider storage s) {
-        assembly {
-            mstore(0, PROVIDER_SLOT)
-            mstore(32, id)
-            s.slot := keccak256(0, 64)
-        }
+    function setToken(address _predictionToken) external {
+        require(msg.sender == owner, "only owner");
+        predictionToken = _predictionToken;
     }
 
-    function ids() internal pure returns (Schema.Ids storage s) {
-        assembly {
-            mstore(0, IDS_SLOT)
-            s.slot := keccak256(0, 32)
-        }
+    function createProvider(string calldata _permittedProviderHashInStr, string calldata countKey, string calldata userIdKey) external {
+        require(msg.sender == owner, "only owner");
+        Provider storage provider = providers[keccak256(bytes(_permittedProviderHashInStr))];
+        provider.countKey = countKey;
+        provider.userIdKey = userIdKey;
     }
+
+    function createMarketWithZKP(uint256 minRange, uint256 maxRange, uint256 step,uint256 duration, Reclaim.Proof memory proof) external {
+        Reclaim(reclaimAddress).verifyProof(proof); //zkp
+
+        bytes32 oracleProviderHash = keccak256(bytes(Utils.extractValue(proof.claimInfo.context, "providerHash")));
+        Provider memory usedProvider = providers[oracleProviderHash];
+        require(keccak256(bytes(usedProvider.countKey)) != keccak256(bytes("")), "there is no provider");
+
+        uint256 targetAccountFollowerOrLikeCount = Utils.stringToUint(Utils.getFromExtractedParams(proof.claimInfo.context, usedProvider.countKey));
+        string memory targetAccountId  = Utils.getFromExtractedParams(proof.claimInfo.context, usedProvider.userIdKey);
+        
+        RangeScalarMarketNoState(predictionToken).createMarket(
+            targetAccountId,
+            targetAccountFollowerOrLikeCount,
+            minRange,
+            maxRange,
+            step,
+            oracleProviderHash,
+            duration
+        );
+        console.log("---- createMarket ----");
+        console.log(targetAccountId);
+        console.log(targetAccountFollowerOrLikeCount);
+    }
+
+    function resolveMarket(uint256 marketId, Reclaim.Proof memory proof) external {
+        console.log('----- Oracle:resolveMarket ---------');
+        Reclaim(reclaimAddress).verifyProof(proof); //zkp
+        console.log("succees to verify");
+        RangeScalarMarketNoState.Market memory market = RangeScalarMarketNoState(predictionToken).getMarket(marketId);
+        console.log("may be there!");
+        bytes32 oracleProviderHash = keccak256(bytes(Utils.extractValue(proof.claimInfo.context, "providerHash")));
+        console.log("NO?????????? WHY???????");
+        // require(keccak256(bytes(market.targetAccountId)) == keccak256.) should check userID;
+        require(market.oracleProviderHash == oracleProviderHash, "wrong provider is used");
+        console.log("not wrong provider is used");
+        Provider memory usedProvider = providers[market.oracleProviderHash];
+        console.log('usedProvider');
+        require(keccak256(bytes(usedProvider.countKey)) != keccak256(bytes("")), "there is no provider");
+        console.log('not there is no provider');
+        uint256 targetAccountFollowerOrLikeCount = Utils.stringToUint(Utils.getFromExtractedParams(proof.claimInfo.context, usedProvider.countKey));
+        console.log("targetAccountFollowerOrLikeCount", targetAccountFollowerOrLikeCount);
+        RangeScalarMarketNoState(predictionToken).resolveMarket(marketId, targetAccountFollowerOrLikeCount);
+
+    }
+
 }
 
 library Utils {
@@ -195,78 +199,5 @@ library Utils {
         }
 
         return result;
-    }
-}
-
-contract DataHub {
-    event ProviderCreated(uint256 indexed id, string providerHash);
-    event ArticleCreated(uint256 indexed id, string content, address creator);
-    event PropositionCreated(uint256 indexed id, string proposition);
-
-    function verifyProof(Reclaim.Proof memory proof, uint256 providerId) external {
-        Schema.Ids storage ids = Storage.ids();
-        Schema.Provider storage provider = Storage.provider(providerId);
-        Reclaim(Addresses.BASE_SEPOLIA).verifyProof(proof);
-        string memory providerHashInStr = Utils.getFromExtractedParams(proof.claimInfo.context, "providerHash");
-        require(provider.providerHash == keccak256(bytes(providerHashInStr)), "wrong data provider");
-
-        string memory result;
-        for (uint256 i = 0; i < provider.keys.length; i++) {
-            string memory key = provider.keys[i];
-            string memory value = Utils.getFromExtractedParams(proof.claimInfo.context, provider.keys[i]);
-            string memory line = string(abi.encodePacked(key, ": ", value, "\n"));
-            result = string(abi.encodePacked(result, line));
-        }
-
-        uint256 newArticleId = ++ids.articleId;
-        Schema.Article storage article = Storage.article(newArticleId);
-        article.content = result;
-        article.createdBy = msg.sender;
-        article.createdAt = block.timestamp;
-    }
-
-    function createProvider(string memory providerHash, string[] memory keys) external returns (uint256) {
-        Schema.Ids storage ids = Storage.ids();
-        uint256 newProviderId = ++ids.providerId;
-
-        Schema.Provider storage provider = Storage.provider(newProviderId);
-        provider.providerHash = keccak256(bytes(providerHash));
-        provider.keys = keys;
-
-        emit ProviderCreated(newProviderId, providerHash);
-        return newProviderId;
-    }
-
-    function createProposition(string memory proposition, uint256[] memory providerIds) external returns (uint256) {
-        Schema.Ids storage ids = Storage.ids();
-        uint256 newPropositionId = ++ids.propositionId;
-
-        Schema.Proposition storage newProposition = Storage.proposition(newPropositionId);
-        newProposition.proposition = proposition;
-        newProposition.permittedProviderIds = providerIds;
-
-        emit PropositionCreated(newPropositionId, proposition);
-        return newPropositionId;
-    }
-
-    function getProvider(uint256 providerId) external pure returns (Schema.Provider memory) {
-        return Storage.provider(providerId);
-    }
-
-    function getArticle(uint256 articleId) external pure returns (Schema.Article memory) {
-        return Storage.article(articleId);
-    }
-
-    function getProposition(uint256 propositionId) external pure returns (Schema.Proposition memory) {
-        return Storage.proposition(propositionId);
-    }
-
-    // 既存コードの実装
-    function getArticles(uint256[] memory articleIds) external view returns (string[] memory) {
-        string[] memory articles = new string[](articleIds.length);
-        for (uint256 i = 0; i < articleIds.length; i++) {
-            articles[i] = Storage.article(articleIds[i]).content;
-        }
-        return articles;
     }
 }

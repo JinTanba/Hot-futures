@@ -1,10 +1,10 @@
-// SPD-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "forge-std/console.sol";
 
-contract RangeScalarMarketNoState is ERC1155, Ownable {
+contract RangeScalarMarketNoState is ERC1155 {
 
     struct Market {
         string targetAccountId;
@@ -14,10 +14,11 @@ contract RangeScalarMarketNoState is ERC1155, Ownable {
         uint256 minRange;  
         uint256 maxRange;    
         uint256 step;
+        bytes32 oracleProviderHash;
+        uint256 deadline;
     }
 
     address public oracle;
-
     uint256 public marketIdCounter;
 
     mapping(uint256 => Market) public markets;
@@ -31,7 +32,9 @@ contract RangeScalarMarketNoState is ERC1155, Ownable {
         uint256 currentAccountFollowerCount,
         uint256 minRange,
         uint256 maxRange,
-        uint256 step
+        uint256 step,
+        bytes32 oracleProviderHash,//こいつきもしね
+        uint256 duration
     )
         external
     {
@@ -48,95 +51,119 @@ contract RangeScalarMarketNoState is ERC1155, Ownable {
             finalValue: 0,
             minRange: minRange,
             maxRange: maxRange,
-            step: step
+            step: step,
+            oracleProviderHash: oracleProviderHash,
+            deadline: block.timestamp + duration
         });
     }
 
     function split(uint256 marketId) external payable {
-        Market storage market = markets[marketId];
-        require(!market.resolved, "Market resolved");
         require(msg.value > 0, "No collateral sent");
 
+        Market storage market = markets[marketId];
         uint256 numRanges = _getNumRanges(market);
+
+        uint256 outcomeCount = 2 * numRanges;
+
+        uint256[] memory tokenIds = new uint256[](outcomeCount);
+        uint256[] memory amounts  = new uint256[](outcomeCount);
 
         for (uint256 i = 0; i < numRanges; i++) {
             uint256 shortId = _encodeTokenId(marketId, i, true);
             uint256 longId  = _encodeTokenId(marketId, i, false);
 
-            _mint(msg.sender, shortId, msg.value, "");
-            _mint(msg.sender, longId,  msg.value, "");
+            tokenIds[2*i] = shortId;
+            amounts[2*i]  = msg.value;
+            tokenIds[2*i+1] = longId;
+            amounts[2*i+1]  = msg.value;
         }
+
+        _mintBatch(msg.sender, tokenIds, amounts, "");
     }
+
 
     function merge(uint256 marketId, uint256 amount) external {
         Market storage market = markets[marketId];
         require(!market.resolved, "Cannot merge after resolution");
+        // require(block.timestamp < market.deadline, "Cannot merge after deadline"); //TODO: foundryのanvilは時間止まってる
+        (uint256[] memory tokenIds, uint256[] memory amounts) = _getTokenIdsAndAmounts(marketId, amount);
+        _burnBatch(msg.sender, tokenIds, amounts);
+        payable(msg.sender).transfer(amount);
+    }
+
+
+    function resolveMarket(uint256 marketId, uint256 currentFolloweCount) external {
+        console.log("--------Token:resolveMarket--------");
+        require(msg.sender == oracle, "Only oracle can resolve");
+        Market storage market = markets[marketId];
+        // require(market.deadline < block.timestamp, "market is not over");//TODO: foundryのanvilは時間止まってる
+        require(!market.resolved, "Already resolved");
+        market.resolved = true;
+        market.finalValue = currentFolloweCount - market.currentAccountFollowerCount;
+        console.log('so less than 0????');
+    }
+
+    function redeemPositions(uint256 marketId) external {
+        Market storage market = markets[marketId];
+        require(market.resolved, "Market not resolved yet");
+
+        uint256 x = market.finalValue;
+        uint256 totalPayout = 0;
 
         uint256 numRanges = _getNumRanges(market);
+        (bool found, uint256 subrangeIndex) = _findSubrangeForValue(market, x);
+
+        uint256[] memory burnTokenIds = new uint256[](2 * numRanges);
+        uint256[] memory burnAmounts  = new uint256[](2 * numRanges);
 
         for (uint256 i = 0; i < numRanges; i++) {
             uint256 shortId = _encodeTokenId(marketId, i, true);
             uint256 longId  = _encodeTokenId(marketId, i, false);
 
-            _burn(msg.sender, shortId, amount);
-            _burn(msg.sender, longId,  amount);
-        }
+            uint256 shortBalance = balanceOf(msg.sender, shortId);
+            uint256 longBalance  = balanceOf(msg.sender, longId);
 
-        payable(msg.sender).transfer(amount);
-    }
-
-    function resolveMarket(uint256 marketId, uint256 currentFolloweCount) external {
-        require(msg.sender == oracle, "Only oracle can resolve");
-        Market storage market = markets[marketId];
-        require(!market.resolved, "Already resolved");
-
-        market.resolved = true;
-        market.finalValue = currentFolloweCount - market.currentAccountFollowerCount;
-    }
-
-    function redeemPositions(
-        uint256 marketId,
-        uint256[] calldata tokenIds,
-        uint256[] calldata amounts
-    )
-        external
-    {
-        require(tokenIds.length == amounts.length, "Length mismatch");
-        Market storage market = markets[marketId];
-        require(market.resolved, "Market not resolved yet");
-
-        uint256 x = market.finalValue;
-        (bool found, uint256 xRangeIndex) = _findSubrangeForValue(market, x);
-
-        uint256 totalPayout;
-
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            uint256 tokenId = tokenIds[i];
-            uint256 amount  = amounts[i];
-
-            (uint256 decodedMarketId, uint256 rangeIndex, bool isShort)
-                = _decodeTokenId(tokenId);
-
-            require(decodedMarketId == marketId, "Token not in this market");
-
-            _burn(msg.sender, tokenId, amount);
-
-            if (!found || (rangeIndex != xRangeIndex)) {
-                continue;
+            if (shortBalance > 0 && found && i == subrangeIndex) {
+                uint256 shortPayout = _calculatePayoutWithinIncludedRange(
+                    market,
+                    i,
+                    x,
+                    true,
+                    shortBalance
+                );
+                totalPayout += shortPayout;
+                burnTokenIds[2 * i] = shortId;
+                burnAmounts[2 * i]  = shortBalance;
+            } else {
+                burnTokenIds[2 * i] = shortId;
+                burnAmounts[2 * i]  = 0;
             }
 
-            uint256 payout = _calculatePayoutWithinIncludedRange(
-                market, 
-                xRangeIndex,
-                x,
-                isShort,
-                amount
-            );
-            totalPayout += payout;
+            if (longBalance > 0 && found && i == subrangeIndex) {
+                uint256 longPayout = _calculatePayoutWithinIncludedRange(
+                    market,
+                    i,
+                    x,
+                    false,
+                    longBalance
+                );
+
+                totalPayout += longPayout;
+                burnTokenIds[2 * i + 1] = longId;
+                burnAmounts[2 * i + 1]  = longBalance;
+            } else {
+                burnTokenIds[2 * i + 1] = longId;
+                burnAmounts[2 * i + 1]  = 0;
+            }
         }
 
-        payable(msg.sender).transfer(totalPayout);
+        _burnBatch(msg.sender, burnTokenIds, burnAmounts);
+
+        if (totalPayout > 0) {
+            payable(msg.sender).transfer(totalPayout);
+        }
     }
+
 
     function _findSubrangeForValue(Market storage market, uint256 x)
         internal
@@ -172,11 +199,11 @@ contract RangeScalarMarketNoState is ERC1155, Ownable {
         uint256 subrangeMax = subrangeMin + market.step;
 
         if (isShort) {
-            uint256 numerator   = (subrangeMax > x) ? (subrangeMax - x) : 0;
+            uint256 numerator = (subrangeMax > x) ? (subrangeMax - x) : 0;
             uint256 denominator = market.step;
             return (amount * numerator) / denominator;
         } else {
-            uint256 numerator   = (x > subrangeMin) ? (x - subrangeMin) : 0;
+            uint256 numerator = (x > subrangeMin) ? (x - subrangeMin) : 0;
             uint256 denominator = market.step;
             return (amount * numerator) / denominator;
         }
@@ -186,6 +213,7 @@ contract RangeScalarMarketNoState is ERC1155, Ownable {
         return (market.maxRange - market.minRange) / market.step;
     }
 
+    //[...128][]
     function _encodeTokenId(
         uint256 _marketId,
         uint256 _rangeIndex,
@@ -211,5 +239,30 @@ contract RangeScalarMarketNoState is ERC1155, Ownable {
         uint256 lower128 = tokenId & ((uint256(1) << 128) - 1);
         isShort = (lower128 & 1) == 1;
         rangeIndex = (lower128 >> 1);
+    }
+
+    function _getTokenIdsAndAmounts(uint256 marketId,uint256 baseAmount) internal view returns (uint256[] memory tokenIds, uint256[] memory amounts) {
+        Market storage market = markets[marketId];
+        uint256 numRanges = _getNumRanges(market);
+
+        tokenIds = new uint256[](numRanges * 2);
+        amounts  = new uint256[](numRanges * 2);
+
+        for (uint256 i = 0; i < numRanges; i++) {
+            uint256 shortId = _encodeTokenId(marketId, i, true);
+            uint256 longId  = _encodeTokenId(marketId, i, false);
+
+            tokenIds[2 * i]     = shortId;
+            tokenIds[2 * i + 1] = longId;
+
+            amounts[2 * i]     = baseAmount;
+            amounts[2 * i + 1] = baseAmount;
+        }
+
+        return (tokenIds, amounts);
+    }
+
+    function getMarket(uint256 marketId) external view returns(Market memory) {
+        return markets[marketId];
     }
 }
